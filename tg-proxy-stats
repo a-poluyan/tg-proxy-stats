@@ -1,0 +1,534 @@
+#!/usr/bin/python3
+"""Monitor the client side of configured IPv4 TCP port redirects."""
+
+import argparse
+from collections import Counter, defaultdict
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import errno
+import os
+from pathlib import Path
+import socket
+import sqlite3
+import struct
+import sys
+import time
+
+
+INITIAL_PORTS = [(port, 1443) for port in range(7000, 7021)] + [
+    (port, 2443) for port in range(8000, 8021)
+]
+INTERVAL = 60
+RETENTION_DAYS = 30
+ACTIVE_BYTES = 1024
+ALERT_MINUTES = 15
+ALERT_IPS = 3
+MSK = timezone(timedelta(hours=3))
+DB_PATH = Path("/var/lib/tg-proxy-stats/stats.sqlite3")
+
+# Linux UAPI in nfnetlink.h, nfnetlink_conntrack.h and nf_conntrack_common.h.
+NETLINK_NETFILTER = 12
+SO_RCVBUFFORCE = 33  # Linux socket option, requires CAP_NET_ADMIN
+CT_NEW, CT_GET, CT_DELETE = 0x100, 0x101, 0x102
+CT_GROUPS = 0b111  # NEW, UPDATE, DESTROY
+TCP_ESTABLISHED = 3
+IPS_ASSURED, IPS_DST_NAT = 1 << 2, 1 << 5
+NL_HEADER = struct.Struct("=IHHII")
+NLA_HEADER = struct.Struct("=HH")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS usage (
+    minute INTEGER, port INTEGER, ip TEXT,
+    up INTEGER, down INTEGER, first INTEGER, last INTEGER,
+    opened INTEGER, active INTEGER, live INTEGER,
+    PRIMARY KEY (minute, port, ip)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS checkpoints (
+    flow BLOB PRIMARY KEY, up INTEGER, down INTEGER, established INTEGER, seen INTEGER
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS state (
+    id INTEGER PRIMARY KEY CHECK (id = 1), boot TEXT, started INTEGER, snapshot INTEGER
+);
+CREATE TABLE IF NOT EXISTS gaps (start INTEGER, end INTEGER, reason TEXT);
+CREATE TABLE IF NOT EXISTS ports (
+    port INTEGER PRIMARY KEY, target INTEGER NOT NULL,
+    activation INTEGER NOT NULL, ready INTEGER NOT NULL
+);
+"""
+
+
+@dataclass(frozen=True)
+class Flow:
+    key: bytes
+    port: int
+    target: int
+    ip: str
+    up: int | None
+    down: int | None
+    established: bool
+    live: bool
+
+
+def attributes(data):
+    fields = {}
+    offset = 0
+    while offset < len(data):
+        length, kind = NLA_HEADER.unpack_from(data, offset)
+        if length < NLA_HEADER.size or offset + length > len(data):
+            raise ValueError("invalid conntrack attribute length")
+        fields[kind & 0x3FFF] = data[offset + NLA_HEADER.size:offset + length]
+        offset += (length + 3) & ~3
+    return fields
+
+
+def ct_bytes(raw):
+    counter = attributes(raw).get(2)  # CTA_COUNTERS_BYTES, 64-bit big-endian
+    return int.from_bytes(counter, "big") if counter is not None else None
+
+
+def parse_flow(payload):
+    if payload[0] != socket.AF_INET:
+        return None
+    ct = attributes(payload[4:])
+    status = int.from_bytes(ct[3], "big")
+    if not status & IPS_DST_NAT:
+        return None
+    original = attributes(ct[1])
+    proto = attributes(original[2])
+    if proto.get(1) != b"\x06":
+        return None
+    port = int.from_bytes(proto[3], "big")
+    reply_proto = attributes(attributes(ct[2])[2])
+    target = int.from_bytes(reply_proto[2], "big")
+    ip = attributes(original[1])
+    tcp = attributes(attributes(ct.get(4, b"")).get(1, b""))
+    live = tcp.get(1) == bytes([TCP_ESTABLISHED])
+    zone = ct.get(18, original.get(3, b"\0\0"))
+    return Flow(
+        ct[12] + zone + ip[1] + ip[2] + proto[2] + proto[3],
+        port, target, socket.inet_ntoa(ip[1]), ct_bytes(ct.get(9, b"")),
+        ct_bytes(ct.get(10, b"")), bool(status & IPS_ASSURED) or live, live,
+    )
+
+
+def netlink(groups=0):
+    sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_NETFILTER)
+    try:
+        if groups:
+            # Keep draining events after a burst or a concurrent table dump.
+            sock.setsockopt(socket.SOL_SOCKET, SO_RCVBUFFORCE, 4 * 1024 * 1024)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        sock.bind((0, groups))
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+def messages(sock):
+    data, _, flags, sender = sock.recvmsg(1024 * 1024)
+    if sender[0] != 0:
+        return
+    if flags & socket.MSG_TRUNC:
+        raise OSError(errno.ENOBUFS, "truncated conntrack message")
+    offset = 0
+    while offset < len(data):
+        length, kind, flags, _, _ = NL_HEADER.unpack_from(data, offset)
+        if length < NL_HEADER.size or offset + length > len(data):
+            raise ValueError("invalid conntrack message length")
+        payload = data[offset + NL_HEADER.size:offset + length]
+        offset += (length + 3) & ~3
+        if flags & 0x10:  # NLM_F_DUMP_INTR
+            raise OSError(errno.EINTR, "conntrack table changed during snapshot")
+        if kind == 4:  # NLMSG_OVERRUN
+            raise OSError(errno.ENOBUFS, "incomplete conntrack data")
+        if kind in (2, 3) and len(payload) >= 4:  # NLMSG_ERROR / NLMSG_DONE
+            error = struct.unpack_from("=i", payload)[0]
+            if error < 0:
+                raise OSError(-error, "conntrack netlink request failed")
+        yield kind, payload
+
+
+def read_snapshot():
+    flows = []
+    with netlink() as sock:
+        sock.settimeout(5)
+        request = NL_HEADER.pack(20, CT_GET, 0x301, 1, 0)
+        sock.sendto(request + struct.pack("!BBH", socket.AF_INET, 0, 0), (0, 0))
+        while True:
+            for kind, payload in messages(sock):
+                if kind == 3:
+                    return flows
+                if kind == CT_NEW and (flow := parse_flow(payload)) is not None:
+                    flows.append(flow)
+
+
+def snapshot():
+    for attempt in range(3):
+        try:
+            return read_snapshot()
+        except OSError as error:
+            if error.errno not in (errno.EINTR, errno.ENOBUFS) or attempt == 2:
+                raise
+
+
+def initialize(db):
+    db.executescript(SCHEMA)
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+            db.executemany("INSERT INTO ports VALUES (?, ?, 0, 1)", INITIAL_PORTS)
+            db.execute("PRAGMA user_version = 1")
+
+
+def monitored_ports(db):
+    return {port: (target, activation, ready) for port, target, activation, ready in
+            db.execute("SELECT port, target, activation, ready FROM ports ORDER BY port")}
+
+
+def observe(db, flow, stamp, activation, *, sampled=False, baseline=False, destroyed=False):
+    # Keep the existing checkpoint keys for the migrated ports. New activations
+    # of a port must start with their own counters, even on the same TCP flow.
+    key = struct.pack("!Q", activation) + flow.key if activation else flow.key
+    previous = db.execute(
+        "SELECT up, down, established FROM checkpoints WHERE flow = ?", (key,)
+    ).fetchone()
+    if activation and destroyed and previous is None:
+        # A delayed DESTROY may be from before this port was activated.
+        return
+    old_up, old_down, was_established = previous or (0, 0, 0)
+    if baseline:
+        old_up, old_down = flow.up or 0, flow.down or 0
+    # An event queued during a dump can contain older counters than the dump.
+    up = max(old_up, flow.up or 0)
+    down = max(old_down, flow.down or 0)
+    established = was_established or flow.established
+    db.execute("REPLACE INTO checkpoints VALUES (?, ?, ?, ?, ?)",
+               (key, up, down, established, stamp))
+    traffic = up - old_up + down - old_down
+    opened = int(established and not was_established)
+    observed = stamp if flow.live or opened else None
+    if not (traffic or observed):
+        return
+    db.execute("""
+        INSERT INTO usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(minute, port, ip) DO UPDATE SET
+            up = up + excluded.up, down = down + excluded.down,
+            first = COALESCE(min(first, excluded.first), first, excluded.first),
+            last = COALESCE(max(last, excluded.last), last, excluded.last),
+            opened = opened + excluded.opened, active = active + excluded.active,
+            live = live + excluded.live
+    """, (stamp // INTERVAL, flow.port, flow.ip, up - old_up, down - old_down,
+          observed, observed, opened,
+          traffic if established else 0, int(sampled and flow.live)))
+
+
+def save_snapshot(db, flows, stamp, boot):
+    ports = monitored_ports(db)
+    db.execute("UPDATE usage SET live = 0 WHERE minute = ? AND live > 0",
+               (stamp // INTERVAL,))
+    for flow in flows:
+        setting = ports.get(flow.port)
+        if setting and setting[0] == flow.target:
+            _, activation, ready = setting
+            observe(db, flow, stamp, activation, sampled=True, baseline=not ready)
+    db.execute("UPDATE ports SET ready = 1 WHERE ready = 0")
+    # Retain retired checkpoints briefly for a late or repeated DESTROY event.
+    db.execute("DELETE FROM checkpoints WHERE seen < ?", (stamp - 600,))
+    cutoff = stamp - RETENTION_DAYS * 86400
+    db.execute("DELETE FROM usage WHERE minute < ?", (cutoff // INTERVAL,))
+    db.execute("DELETE FROM gaps WHERE end < ?", (cutoff,))
+    db.execute("""
+        INSERT INTO state VALUES (1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET boot = excluded.boot, snapshot = excluded.snapshot
+    """, (boot, stamp, stamp))
+
+
+def save_events(db, batch, stamp):
+    events = [(kind, flow) for kind, payload in batch
+              if kind in (CT_NEW, CT_DELETE) and (flow := parse_flow(payload)) is not None]
+    if events:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            for kind, flow in events:
+                setting = db.execute(
+                    "SELECT activation FROM ports WHERE port = ? AND target = ? AND ready = 1",
+                    (flow.port, flow.target),
+                ).fetchone()
+                if setting is not None:
+                    observe(db, flow, stamp, setting[0], destroyed=kind == CT_DELETE)
+
+
+def collect():
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as db, netlink(CT_GROUPS) as events:
+        db.execute("PRAGMA journal_mode = WAL")
+        initialize(db)
+        previous_boot, last = db.execute("SELECT boot, snapshot FROM state").fetchone() or (boot, 0)
+        with db:
+            if previous_boot != boot:
+                db.execute("DELETE FROM checkpoints")
+            if last:
+                db.execute("INSERT INTO gaps VALUES (?, ?, ?)",
+                           (last, int(time.time()), "перезапуск сборщика"))
+        due = time.monotonic()
+        last_event = int(time.time())
+        while True:
+            remaining = due - time.monotonic()
+            if remaining <= 0:
+                try:
+                    # Serialize a port change with the snapshot that sets its baseline.
+                    with db:
+                        db.execute("BEGIN IMMEDIATE")
+                        flows = snapshot()
+                        last = int(time.time())
+                        save_snapshot(db, flows, last, boot)
+                except OSError as error:
+                    if error.errno not in (errno.EINTR, errno.ENOBUFS) and not isinstance(error, TimeoutError):
+                        raise
+                    print(f"Повтор снимка conntrack: {error}", file=sys.stderr)
+                    due = time.monotonic() + 5
+                    continue
+                due += (int((time.monotonic() - due) // INTERVAL) + 1) * INTERVAL
+                continue
+            events.settimeout(remaining)
+            try:
+                batch = list(messages(events))
+            except TimeoutError:
+                continue
+            except OSError as error:
+                if error.errno != errno.ENOBUFS:
+                    raise
+                now = int(time.time())
+                with db:
+                    db.execute("INSERT INTO gaps VALUES (?, ?, ?)",
+                               (min(last or now, last_event), now, "потеря событий conntrack"))
+                print(f"Потеря событий conntrack: {error}", file=sys.stderr)
+                due = time.monotonic() + 1
+                continue
+            last_event = int(time.time())
+            save_events(db, batch, last_event)
+
+
+def format_time(stamp):
+    return datetime.fromtimestamp(stamp, MSK).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def format_size(size):
+    for unit in ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ"):
+        if size < 1024 or unit == "ТиБ":
+            return f"{size:.0f} {unit}" if unit == "Б" else f"{size:.2f} {unit}"
+        size /= 1024
+
+
+def show_now(ports):
+    live = defaultdict(Counter)
+    for flow in snapshot():
+        setting = ports.get(flow.port)
+        if flow.live and setting and flow.target == setting[0]:
+            live[flow.port][flow.ip] += 1
+    print(f"Снимок на {format_time(int(time.time()))} МСК")
+    print(f"{'Порт':>5} {'TCP сейчас':>11} {'IP сейчас':>10}")
+    for port in ports:
+        print(f"{port:>5} {sum(live[port].values()):>11} {len(live[port]):>10}")
+        if len(ports) == 1:
+            for ip, count in live[port].most_common():
+                print(f"      {ip:<15} {count} TCP")
+
+
+def alert_streaks(db, start, end):
+    streaks = {}
+    for port, minute in db.execute("""
+        SELECT port, minute FROM usage
+        WHERE minute BETWEEN ? AND ? AND live > 0 AND active >= ?
+        GROUP BY port, minute HAVING COUNT(*) >= ? ORDER BY port, minute
+    """, (start, end, ACTIVE_BYTES, ALERT_IPS)):
+        previous, streak = streaks.get(port, (None, 0))
+        streak = streak + 1 if previous == minute - 1 else 1
+        streaks[port] = (minute, streak)
+        if streak >= ALERT_MINUTES:
+            yield port, minute - streak + 1, minute
+
+
+def show_report(db, ports, settings, days):
+    stamp = int(time.time())
+    end = stamp // INTERVAL
+    start = end - days * 1440 + 1
+    saved = db.execute("SELECT started, snapshot FROM state").fetchone()
+    if saved is None:
+        print("Сборщик готовит первый снимок.")
+        return
+    started, last = saved
+    print(f"Период: последние {days} сут. Снимок от {format_time(last)} МСК.")
+    if start * INTERVAL < started:
+        print(f"История собирается с {format_time(started)} МСК.")
+    if stamp - last > 2 * INTERVAL:
+        print("Снимок устарел. Проверьте службу tg-proxy-stats.")
+    totals = {p: (u, d) for p, u, d in db.execute(
+        "SELECT port, SUM(up), SUM(down) FROM usage WHERE minute BETWEEN ? AND ? GROUP BY port",
+        (start, end))}
+    live = {p: (n, i) for p, n, i in db.execute(
+        "SELECT port, SUM(live), COUNT(*) FROM usage WHERE minute = ? AND live > 0 GROUP BY port",
+        (last // INTERVAL,))}
+    active = dict(db.execute("""
+        SELECT port, COUNT(*) FROM (
+            SELECT port, ip FROM usage WHERE minute BETWEEN ? AND ?
+            GROUP BY port, ip HAVING SUM(active) >= ?
+        ) GROUP BY port
+    """, (end - 4, end, ACTIVE_BYTES)))
+    warnings = {p: (a, b) for p, a, b in alert_streaks(db, start, end)}
+    print(f"{'Порт':>5} {'Клиент→прокси':>15} {'Прокси→клиент':>15} {'Всего':>12}"
+          f" {'TCP':>5} {'IP':>4} {'IP за 5 мин':>12}")
+    for port in ports:
+        up, down = totals.get(port, (0, 0))
+        flag = "  проверить" if port in warnings else ""
+        if port in settings and settings[port][2]:
+            tcp, ips = live.get(port, (0, 0))
+            recent = active.get(port, 0)
+        else:
+            tcp = ips = recent = "—"
+            flag += "  ждёт снимка" if port in settings else "  история"
+        print(f"{port:>5} {format_size(up):>15} {format_size(down):>15}"
+              f" {format_size(up + down):>12} {tcp:>5} {ips:>4} {recent:>12}{flag}")
+    if len(ports) == 1:
+        show_details(db, ports[0], start, end, warnings)
+    for gap_start, gap_end, reason in db.execute(
+        "SELECT start, end, reason FROM gaps WHERE end >= ? AND start <= ? ORDER BY start",
+        (start * INTERVAL, stamp),
+    ):
+        print(f"Данные могут быть неполными {format_time(gap_start)} – {format_time(gap_end)} МСК"
+              f" ({reason}).")
+
+
+def show_details(db, port, start, end, warnings):
+    daily = defaultdict(lambda: [0, 0])
+    for minute, up, down in db.execute("""
+        SELECT minute, SUM(up), SUM(down) FROM usage WHERE port = ? AND minute BETWEEN ? AND ?
+        GROUP BY minute ORDER BY minute
+    """, (port, start, end)):
+        day = datetime.fromtimestamp(minute * INTERVAL, MSK).date()
+        daily[day][0] += up
+        daily[day][1] += down
+    print("\nПо дням (МСК)\nДата             От клиента        К клиенту")
+    for day, (up, down) in daily.items():
+        print(f"{day:%d.%m.%Y}   {format_size(up):>13}    {format_size(down):>13}")
+    print("\nИстория IP с установленными TCP-соединениями")
+    print(f"{'IP':<15} {'Первый раз (МСК)':<19} {'Последний раз (МСК)':<19}"
+          f" {'TCP':>5} {'От клиента':>13} {'К клиенту':>13}")
+    for ip, first, last, opens, up, down in db.execute("""
+        SELECT ip, MIN(first), MAX(last), SUM(opened), SUM(up), SUM(down) FROM usage
+        WHERE port = ? AND minute BETWEEN ? AND ? GROUP BY ip
+        HAVING MIN(first) IS NOT NULL ORDER BY MAX(last) DESC, ip
+    """, (port, start, end)):
+        print(f"{ip:<15} {format_time(first)} {format_time(last)} {opens:>5}"
+              f" {format_size(up):>13} {format_size(down):>13}")
+    if port in warnings:
+        first, last = warnings[port]
+        print(f"\nПроверить порт: {ALERT_IPS}+ активных IP в каждом минутном снимке"
+              f" с {format_time(first * INTERVAL)} по {format_time(last * INTERVAL)} МСК.")
+        for ip, minutes, total in db.execute("""
+            SELECT ip, COUNT(*), SUM(active) FROM usage
+            WHERE port = ? AND minute BETWEEN ? AND ? AND live > 0 AND active >= ?
+            GROUP BY ip ORDER BY COUNT(*) DESC, SUM(active) DESC
+        """, (port, first, last, ACTIVE_BYTES)):
+            print(f"  {ip:<15} {minutes:>3} мин   {format_size(total)}")
+
+
+def port_number(value):
+    try:
+        port = int(value)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("порт должен быть целым числом от 1 до 65535")
+    return port
+
+
+def port_mapping(value):
+    fields = value.split(":")
+    if len(fields) != 2:
+        raise argparse.ArgumentTypeError("укажите ВХОДЯЩИЙ:ЦЕЛЕВОЙ, например 7021:1443")
+    return tuple(map(port_number, fields))
+
+
+def add_port(db, port, target):
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        existing = db.execute("SELECT target FROM ports WHERE port = ?", (port,)).fetchone()
+        if existing:
+            if existing[0] != target:
+                raise ValueError(f"Порт {port} уже настроен на {existing[0]}. Сначала удалите его из мониторинга.")
+            return False
+        db.execute("INSERT INTO ports VALUES (?, ?, ?, 0)", (port, target, time.time_ns()))
+        return True
+
+
+def remove_port(db, port):
+    with db:
+        return bool(db.execute("DELETE FROM ports WHERE port = ?", (port,)).rowcount)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Статистика Telegram-прокси по исходным портам")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--collect", action="store_true", help=argparse.SUPPRESS)
+    mode.add_argument("--now", action="store_true", help="свежий снимок TCP и IP из ядра")
+    mode.add_argument("--list-ports", action="store_true", help="показать порты мониторинга и их цели")
+    mode.add_argument("--add-port", type=port_mapping, metavar="PORT:TARGET", help="добавить порт мониторинга")
+    mode.add_argument("--remove-port", type=port_number, metavar="PORT", help="убрать порт из мониторинга")
+    parser.add_argument("--days", type=int, default=7, metavar="N", help="период, от 1 до 30 суток")
+    parser.add_argument("--port", type=port_number, metavar="PORT", help="детализация по порту")
+    args = parser.parse_args()
+    if not 1 <= args.days <= RETENTION_DAYS:
+        parser.error(f"--days должен быть от 1 до {RETENTION_DAYS}")
+    if args.port is not None and (args.list_ports or args.add_port or args.remove_port or args.collect):
+        parser.error("--port используется для отчёта или свежего снимка")
+    if args.collect:
+        collect()
+        return
+    if args.add_port or args.remove_port:
+        with closing(sqlite3.connect(DB_PATH.as_uri() + "?mode=rw", uri=True, timeout=10)) as db:
+            if args.add_port:
+                port, target = args.add_port
+                if add_port(db, port, target):
+                    print(f"Порт {port} → {target} добавлен. Сбор начнётся с ближайшего минутного снимка.")
+                else:
+                    print(f"Порт {port} → {target} уже в списке мониторинга.")
+            elif remove_port(db, args.remove_port):
+                print(f"Порт {args.remove_port} убран из мониторинга. История доступна через --port.")
+            else:
+                print(f"Порт {args.remove_port} уже отсутствует в списке мониторинга.")
+        return
+    with closing(sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
+        settings = monitored_ports(db)
+        ports = settings if args.port is None else (args.port,)
+        if not ports:
+            print("Список портов мониторинга пуст. Добавьте порт через --add-port.")
+        elif args.list_ports:
+            for port, (target, _, ready) in settings.items():
+                print(f"{port} → {target}" + ("" if ready else "  ждёт снимка"))
+        elif args.now:
+            if args.port is not None and args.port not in settings:
+                parser.error("для --now укажите порт из списка мониторинга")
+            show_now({port: settings[port] for port in ports})
+        else:
+            if args.port is not None and args.port not in settings and not db.execute(
+                "SELECT 1 FROM usage WHERE port = ? LIMIT 1", (args.port,)
+            ).fetchone():
+                parser.error("порт отсутствует в списке мониторинга и истории")
+            show_report(db, ports, settings, args.days)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, sqlite3.Error, ValueError, struct.error) as error:
+        if os.geteuid() != 0 and (
+            isinstance(error, PermissionError)
+            or getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_CANTOPEN
+        ):
+            sys.exit("tg-proxy-stats: для доступа к статистике повторите команду с sudo.")
+        sys.exit(f"tg-proxy-stats: {error}")
