@@ -91,16 +91,28 @@ def check(app):
     assert app["add_port"](db, *app["port_mapping"]("7021:1443"))
     assert app["monitored_ports"](db)[7021][0] == 1443
 
-    db.executemany("INSERT INTO usage VALUES (?, 7005, ?, 1024, 0, NULL, NULL, 0, 1024, 0)",
-                   [(185, "192.0.2.1"), (186, "192.0.2.2"), (200, "192.0.2.3")])
-    report = StringIO()
-    with patch.object(app["time"], "time", return_value=200 * 60), redirect_stdout(report):
-        app["show_report"](db, (7005, 8005), app["monitored_ports"](db), 1)
-    assert "IP за 15 мин" in report.getvalue()
-    row = next(line for line in report.getvalue().splitlines() if line.startswith(" 7005 "))
-    assert row.split()[-1] == "2", row
+    minute = 2000
+    app["save_snapshot"](db, [], minute * 60, "boot")
+    for age, address, opened, established, size in (
+        (1440, "192.0.2.1", 1, True, 1024), (15, "192.0.2.2", 1, True, 1024),
+        (14, "192.0.2.3", 2, True, 500), (0, "192.0.2.3", 1, True, 524),
+        (0, "192.0.2.4", 0, True, 0), (0, "192.0.2.5", 0, False, 1024),
+    ):
+        seen = (minute - age) * 60 if established else None
+        db.execute("INSERT INTO usage VALUES (?, 7021, ?, ?, 0, ?, ?, ?, ?, 0)",
+                   (minute - age, address, size, seen, seen, opened, size if established else 0))
+    for days, traffic, expected in ((1, "3.00", ["4", "2", "1"]), (7, "4.00", ["5", "3", "1"])):
+        report = StringIO()
+        with patch.object(app["time"], "time", return_value=minute * 60), redirect_stdout(report):
+            app["show_report"](db, (7021, 8005), app["monitored_ports"](db), days)
+        output = report.getvalue()
+        assert f"TCP за {days} сут." in output and f"IP за {days} сут." in output
+        assert "IP за 15 мин" in output
+        row = next(line for line in output.splitlines() if line.startswith(" 7021 "))
+        cells = row.split()
+        assert cells[1:3] == [traffic, "КиБ"] and cells[-3:] == expected, row
     db.close()
-    print("OK: flow accounting, alerts, port changes and 15-minute report window")
+    print("OK: flow accounting, alerts, port changes and period totals")
 
 
 if __name__ == "__main__":

@@ -367,33 +367,37 @@ def show_report(db, ports, settings, days):
         print(f"История собирается с {format_time(started)} МСК.")
     if stamp - last > 2 * INTERVAL:
         print("Снимок устарел. Проверьте службу tg-proxy-stats.")
-    totals = {p: (u, d) for p, u, d in db.execute(
-        "SELECT port, SUM(up), SUM(down) FROM usage WHERE minute BETWEEN ? AND ? GROUP BY port",
-        (start, end))}
-    live = {p: (n, i) for p, n, i in db.execute(
-        "SELECT port, SUM(live), COUNT(*) FROM usage WHERE minute = ? AND live > 0 GROUP BY port",
-        (last // INTERVAL,))}
-    active = dict(db.execute("""
-        SELECT port, COUNT(*) FROM (
-            SELECT port, ip FROM usage WHERE minute BETWEEN ? AND ?
-            GROUP BY port, ip HAVING SUM(active) >= ?
-        ) GROUP BY port
-    """, (end - RECENT_IP_MINUTES + 1, end, ACTIVE_BYTES)))
+    totals = {
+        port: (up, down, tcp, ips, recent)
+        for port, up, down, tcp, ips, recent in db.execute("""
+            WITH by_ip AS (
+                SELECT port, SUM(up) AS up, SUM(down) AS down, SUM(opened) AS opened,
+                       SUM(active) AS active,
+                       SUM(active) FILTER (WHERE minute >= ?) AS recent_active
+                FROM usage WHERE minute BETWEEN ? AND ? GROUP BY port, ip
+            )
+            SELECT port, SUM(up), SUM(down), SUM(opened),
+                   COUNT(*) FILTER (WHERE active >= ?),
+                   COUNT(*) FILTER (WHERE recent_active >= ?)
+            FROM by_ip GROUP BY port
+        """, (end - RECENT_IP_MINUTES + 1, start, end, ACTIVE_BYTES, ACTIVE_BYTES))
+    }
     warnings = {p: (a, b) for p, a, b in alert_streaks(db, start, end)}
+    tcp_heading = f"TCP за {days} сут."
+    ip_heading = f"IP за {days} сут."
     recent_heading = f"IP за {RECENT_IP_MINUTES} мин"
     print(f"{'Порт':>5} {'Клиент→прокси':>15} {'Прокси→клиент':>15} {'Всего':>12}"
-          f" {'TCP':>5} {'IP':>4} {recent_heading:>12}")
+          f" {tcp_heading:>14} {ip_heading:>13} {recent_heading:>12}")
     for port in ports:
-        up, down = totals.get(port, (0, 0))
+        up, down, tcp, ips, recent = totals.get(port, (0, 0, 0, 0, 0))
         flag = "  проверить" if port in warnings else ""
-        if port in settings and settings[port][2]:
-            tcp, ips = live.get(port, (0, 0))
-            recent = active.get(port, 0)
-        else:
-            tcp = ips = recent = "—"
-            flag += "  ждёт снимка" if port in settings else "  история"
+        setting = settings.get(port)
+        if setting is None:
+            flag += "  история"
+        elif not setting[2]:
+            flag += "  ждёт снимка"
         print(f"{port:>5} {format_size(up):>15} {format_size(down):>15}"
-              f" {format_size(up + down):>12} {tcp:>5} {ips:>4} {recent:>12}{flag}")
+              f" {format_size(up + down):>12} {tcp:>14} {ips:>13} {recent:>12}{flag}")
     if len(ports) == 1:
         show_details(db, ports[0], start, end, warnings)
     for gap_start, gap_end, reason in db.execute(
