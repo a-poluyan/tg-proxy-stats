@@ -324,6 +324,10 @@ def format_size(size):
         size /= 1024
 
 
+def sorted_ip_rows(rows):
+    return sorted(rows, key=lambda row: socket.inet_aton(row[0]))
+
+
 def show_now(ports):
     live = defaultdict(Counter)
     for flow in snapshot():
@@ -335,7 +339,7 @@ def show_now(ports):
     for port in ports:
         print(f"{port:>5} {sum(live[port].values()):>11} {len(live[port]):>10}")
         if len(ports) == 1:
-            for ip, count in live[port].most_common():
+            for ip, count in sorted_ip_rows(live[port].items()):
                 print(f"      {ip:<15} {count} TCP")
 
 
@@ -423,22 +427,24 @@ def show_details(db, port, start, end, warnings):
     print("\nИстория IP с установленными TCP-соединениями")
     print(f"{'IP':<15} {'Первый раз (МСК)':<19} {'Последний раз (МСК)':<19}"
           f" {'TCP':>5} {'От клиента':>13} {'К клиенту':>13}")
-    for ip, first, last, opens, up, down in db.execute("""
+    history = db.execute("""
         SELECT ip, MIN(first), MAX(last), SUM(opened), SUM(up), SUM(down) FROM usage
         WHERE port = ? AND minute BETWEEN ? AND ? GROUP BY ip
-        HAVING MIN(first) IS NOT NULL ORDER BY MAX(last) DESC, ip
-    """, (port, start, end)):
+        HAVING MIN(first) IS NOT NULL
+    """, (port, start, end))
+    for ip, first, last, opens, up, down in sorted_ip_rows(history):
         print(f"{ip:<15} {format_time(first)} {format_time(last)} {opens:>5}"
               f" {format_size(up):>13} {format_size(down):>13}")
     if port in warnings:
         first, last = warnings[port]
         print(f"\nПроверить порт: {ALERT_IPS}+ активных IP в каждом минутном снимке"
               f" с {format_time(first * INTERVAL)} по {format_time(last * INTERVAL)} МСК.")
-        for ip, minutes, total in db.execute("""
+        flagged = db.execute("""
             SELECT ip, COUNT(*), SUM(active) FROM usage
             WHERE port = ? AND minute BETWEEN ? AND ? AND live > 0 AND active >= ?
-            GROUP BY ip ORDER BY COUNT(*) DESC, SUM(active) DESC
-        """, (port, first, last, ACTIVE_BYTES)):
+            GROUP BY ip
+        """, (port, first, last, ACTIVE_BYTES))
+        for ip, minutes, total in sorted_ip_rows(flagged):
             print(f"  {ip:<15} {minutes:>3} мин   {format_size(total)}")
 
 

@@ -64,12 +64,22 @@ def check(app):
     app["save_snapshot"](db, [], base + 65, "boot")
     assert db.execute("SELECT SUM(live) FROM usage").fetchone() == (0,)
 
+    addresses = ["192.0.2.2", "192.0.2.10", "192.0.10.1"]
     for minute in range(100, 115):
-        for address in ("192.0.2.1", "192.0.2.2", "192.0.2.3"):
+        for address in reversed(addresses):
             db.execute("INSERT INTO usage VALUES (?, 8005, ?, 1000, 1000, 0, 0, 0, 2000, 1)",
                        (minute, address))
     assert list(app["alert_streaks"](db, 100, 113)) == []
     assert list(app["alert_streaks"](db, 100, 114)) == [(8005, 100, 114)]
+    details = StringIO()
+    with redirect_stdout(details):
+        app["show_details"](db, 8005, 100, 114, {8005: (100, 114)})
+    assert [word for word in details.getvalue().split() if word in addresses] == addresses * 2
+    live = StringIO()
+    snapshot = [replace(flow, ip=ip) for ip in reversed(addresses)]
+    with patch.dict(app["show_now"].__globals__, snapshot=lambda: snapshot), redirect_stdout(live):
+        app["show_now"]({7005: (1443, 0, 1)})
+    assert [word for word in live.getvalue().split() if word in addresses] == addresses
     db.commit()
 
     assert app["remove_port"](db, 7005)
@@ -112,7 +122,7 @@ def check(app):
         cells = row.split()
         assert cells[1:3] == [traffic, "КиБ"] and cells[-3:] == expected, row
     db.close()
-    print("OK: flow accounting, alerts, port changes and period totals")
+    print("OK: flow accounting, alerts, port changes, period totals and IPv4 sorting")
 
 
 if __name__ == "__main__":
