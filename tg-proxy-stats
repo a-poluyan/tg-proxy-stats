@@ -22,6 +22,7 @@ INITIAL_PORTS = [(port, 1443) for port in range(7000, 7021)] + [
 INTERVAL = 60
 RETENTION_DAYS = 30
 ACTIVE_BYTES = 1024
+RECENT_IP_MINUTES = 15
 ALERT_MINUTES = 15
 ALERT_IPS = 3
 MSK = timezone(timedelta(hours=3))
@@ -377,10 +378,11 @@ def show_report(db, ports, settings, days):
             SELECT port, ip FROM usage WHERE minute BETWEEN ? AND ?
             GROUP BY port, ip HAVING SUM(active) >= ?
         ) GROUP BY port
-    """, (end - 4, end, ACTIVE_BYTES)))
+    """, (end - RECENT_IP_MINUTES + 1, end, ACTIVE_BYTES)))
     warnings = {p: (a, b) for p, a, b in alert_streaks(db, start, end)}
+    recent_heading = f"IP за {RECENT_IP_MINUTES} мин"
     print(f"{'Порт':>5} {'Клиент→прокси':>15} {'Прокси→клиент':>15} {'Всего':>12}"
-          f" {'TCP':>5} {'IP':>4} {'IP за 5 мин':>12}")
+          f" {'TCP':>5} {'IP':>4} {recent_heading:>12}")
     for port in ports:
         up, down = totals.get(port, (0, 0))
         flag = "  проверить" if port in warnings else ""

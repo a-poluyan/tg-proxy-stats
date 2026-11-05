@@ -1,13 +1,16 @@
 """Run with Python 3.11+ from the project directory."""
 
+from contextlib import redirect_stdout
 from dataclasses import replace
 import errno
+from io import StringIO
 from pathlib import Path
 import runpy
 import socket
 import sqlite3
 import struct
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 def nla(kind, value):
@@ -87,8 +90,17 @@ def check(app):
     assert db.execute("SELECT SUM(up), SUM(down) FROM usage WHERE port = 7005").fetchone() == (980, 1170)
     assert app["add_port"](db, *app["port_mapping"]("7021:1443"))
     assert app["monitored_ports"](db)[7021][0] == 1443
+
+    db.executemany("INSERT INTO usage VALUES (?, 7005, ?, 1024, 0, NULL, NULL, 0, 1024, 0)",
+                   [(185, "192.0.2.1"), (186, "192.0.2.2"), (200, "192.0.2.3")])
+    report = StringIO()
+    with patch.object(app["time"], "time", return_value=200 * 60), redirect_stdout(report):
+        app["show_report"](db, (7005, 8005), app["monitored_ports"](db), 1)
+    assert "IP за 15 мин" in report.getvalue()
+    row = next(line for line in report.getvalue().splitlines() if line.startswith(" 7005 "))
+    assert row.split()[-1] == "2", row
     db.close()
-    print("OK: flow accounting, alerts, migration, port changes and reactivation baseline")
+    print("OK: flow accounting, alerts, port changes and 15-minute report window")
 
 
 if __name__ == "__main__":
